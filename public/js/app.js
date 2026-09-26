@@ -8,6 +8,7 @@ import {
 import {
   VoiceRecorder, computePeaks, createVoicePlayer, stopAllVoice, recordingSupported,
 } from './audio.js';
+import { VoiceClient } from './voice.js';
 
 const $app = document.getElementById('app');
 
@@ -25,6 +26,10 @@ const state = {
   sse: null,
   rec: null,
   recTimer: null,
+  cid: null,
+  voice: null,
+  voiceRoomsLive: new Map(), // roomId -> Map(cid -> { userId, muted })
+  callAvatars: {},
 };
 
 const refs = {};
@@ -60,6 +65,12 @@ function showAuth(expired) {
   stopAllVoice();
   cancelRecordingSilently();
   closeEmoji();
+  if (state.voice && state.voice.active) {
+    try { state.voice.leave(); } catch (_) { /* noop */ }
+  }
+  state.voice = null;
+  state.voiceRoomsLive = new Map();
+  if (refs.callPanel) { refs.callPanel.remove(); refs.callPanel = null; }
   Object.assign(state, {
     user: null, chats: [], currentChatId: null, chatDetail: null,
     messages: [], users: {}, searchQ: '', userResults: [],
@@ -195,8 +206,27 @@ function setFormError(form, errEl, err) {
 
 function showApp() {
   clear($app);
+  state.cid = genCid();
+  state.voice = new VoiceClient(state.cid, {
+    onPeersChanged: () => renderCallPanel(),
+    onLevels: (levels) => {
+      for (const [cid, speaking] of Object.entries(levels)) {
+        const av = state.callAvatars[cid];
+        if (av) av.classList.toggle('is-speaking', !!speaking);
+      }
+    },
+    onKicked: () => {
+      toast('Голосовой канал был удалён или вы отключены');
+      renderVoiceSection();
+      renderCallPanel();
+    },
+    onEnded: () => {
+      renderVoiceSection();
+      renderCallPanel();
+    },
+  });
   buildLayout();
-  state.sse = connectEvents(onServerEvent);
+  state.sse = connectEvents(onServerEvent, state.cid);
   loadChats();
   if (syncTimer) clearInterval(syncTimer);
   syncTimer = setInterval(syncTick, 5000);
@@ -214,6 +244,9 @@ function buildLayout() {
     el('div', { class: 'sidebar__head' },
       el('div', { class: 'brand' }, el('span', { class: 'brand__mark' }, icon('logo', 22)), 'Pulse'),
       el('div', { class: 'sidebar__actions' },
+        state.user.isAdmin
+          ? el('button', { class: 'icon-btn icon-btn--admin', title: 'Админ-панель', onclick: openAdminPanel }, icon('shield', 19))
+          : null,
         el('button', { class: 'icon-btn', title: 'Обзор сообществ', onclick: openDiscover }, icon('compass', 19)),
         el('button', { class: 'icon-btn', title: 'Создать чат, группу или канал', onclick: (e) => openNewChatMenu(e.currentTarget) }, icon('edit', 19)),
         refs.avatarBtn,
@@ -391,7 +424,9 @@ function userRow(u, opts = {}) {
   const row = el('div', { class: 'user-row' + (opts.selected ? ' user-row--selected' : '') },
     avatar({ id: u.id, name: u.nickname, online: u.online }, { size: opts.avatarSize || 40 }),
     el('div', { class: 'user-row__info' },
-      el('span', { class: 'user-row__name' }, u.nickname),
+      el('span', { class: 'user-row__name' },
+        u.nickname,
+        u.isAdmin ? el('span', { class: 'shield-ic', title: 'Администратор' }, icon('shield', 12)) : null),
       el('span', { class: 'user-row__sub' }, '@' + u.username + (u.online ? ' · онлайн' : '')),
     ),
   );
@@ -441,6 +476,10 @@ async function openChat(id) {
   state.chatDetail = detail.chat;
   Object.assign(state.users, msgRes.users || {});
   state.messages = msgRes.messages || [];
+  // сеем живое состояние голосовых комнат из серверных данных
+  for (const r of detail.chat.voice || []) {
+    state.voiceRoomsLive.set(r.id, new Map(r.participants.map((p) => [p.cid, p])));
+  }
   renderChatArea();
   markRead(true);
 }
@@ -465,6 +504,7 @@ function renderEmptyMain() {
   refs.composer = null;
   refs.recBar = null;
   refs.textarea = null;
+  refs.voiceSection = null;
   refs.main.append(el('div', { class: 'empty' },
     el('div', { class: 'empty__mark' }, icon('logo', 64)),
     el('h2', { class: 'empty__title' }, 'Добро пожаловать в Pulse'),
@@ -517,9 +557,17 @@ function renderChatArea() {
   ));
 
   refs.messagesEl = el('div', { class: 'messages' });
+  if (chat.type !== 'dialog') {
+    refs.voiceSection = el('div', { class: 'voice-section' });
+    refs.main.append(refs.voiceSection);
+    renderVoiceSection();
+  } else {
+    refs.voiceSection = null;
+  }
   refs.main.append(refs.messagesEl);
   renderComposer(chat);
   renderMessages();
+  renderCallPanel();
 }
 
 function updateChatHeadSoft() {
@@ -936,6 +984,13 @@ function onServerEvent(e) {
       if (e.chatId === state.currentChatId) refreshCurrentChat();
       scheduleChatsRefresh();
       break;
+    case 'voice_state':
+      applyVoiceState(e);
+      if (state.voice) state.voice.handleVoiceState(e);
+      break;
+    case 'voice_signal':
+      if (state.voice) state.voice.handleSignal(e);
+      break;
     default:
       break;
   }
@@ -947,10 +1002,17 @@ async function refreshCurrentChat() {
   const id = state.currentChatId;
   if (!id) return;
   try {
-    const res = await api.get('/api/chats/' + id + '/messages');
+    const [msgRes, detRes] = await Promise.all([
+      api.get('/api/chats/' + id + '/messages'),
+      api.get('/api/chats/' + id),
+    ]);
     if (state.currentChatId !== id) return;
-    Object.assign(state.users, res.users || {});
-    state.messages = res.messages || [];
+    Object.assign(state.users, msgRes.users || {});
+    state.messages = msgRes.messages || [];
+    if (state.chatDetail) {
+      state.chatDetail = detRes.chat;
+      if (refs.voiceSection) renderVoiceSection();
+    }
     renderMessages(true);
   } catch (err) {
     if (err.status === 403 || err.status === 404) closeChat();
@@ -992,8 +1054,9 @@ function openProfileMenu(anchor) {
     el('div', { class: 'menu__head' },
       avatar({ id: state.user.id, name: state.user.nickname }, { size: 42, dot: false }),
       el('div', { class: 'menu__head-info' },
-        el('span', { class: 'menu__head-name' }, state.user.nickname),
-        el('span', { class: 'menu__head-sub' }, '@' + state.user.username),
+        el('span', { class: 'menu__head-name' }, state.user.nickname,
+          state.user.isAdmin ? el('span', { class: 'shield-ic', title: 'Администратор' }, icon('shield', 13)) : null),
+        el('span', { class: 'menu__head-sub' }, '@' + state.user.username + (state.user.isAdmin ? ' · админ' : '')),
       ),
     ),
     el('button', { class: 'menu__item' }, icon('user', 16), 'Мой профиль'),
@@ -1447,6 +1510,441 @@ function openProfileModal() {
 }
 
 // ============================================================
+//  Голосовые каналы (Discord-style)
+// ============================================================
+
+function canManageVoice(chat) {
+  return !!chat && chat.type !== 'dialog' && (chat.role === 'owner' || chat.role === 'admin');
+}
+
+function voiceUserName(userId) {
+  if (state.user && userId === state.user.id) return state.user.nickname;
+  if (state.users[userId]) return state.users[userId].nickname;
+  if (state.chatDetail && state.chatDetail.memberUsers) {
+    const mu = state.chatDetail.memberUsers.find((u) => u.id === userId);
+    if (mu) return mu.nickname;
+  }
+  const fromChats = state.chats.find((c) => c.peer && c.peer.id === userId);
+  if (fromChats) return fromChats.peer.nickname;
+  return '…';
+}
+
+function applyVoiceState(e) {
+  const roomId = e.roomId;
+  let m = state.voiceRoomsLive.get(roomId);
+  if (e.action === 'join') {
+    if (!m) {
+      m = new Map();
+      state.voiceRoomsLive.set(roomId, m);
+    }
+    m.set(e.connId, { cid: e.connId, userId: e.userId, muted: !!e.muted });
+  } else if (e.action === 'leave' || e.action === 'kick') {
+    if (m) {
+      m.delete(e.connId);
+      if (!m.size) state.voiceRoomsLive.delete(roomId);
+    }
+  } else if (e.action === 'state') {
+    if (m && m.has(e.connId)) m.get(e.connId).muted = !!e.muted;
+  }
+  if (state.chatDetail && e.chatId === state.chatDetail.id && refs.voiceSection) renderVoiceSection();
+  if (state.voice && e.roomId === state.voice.roomId) renderCallPanel();
+}
+
+function renderVoiceSection() {
+  if (!refs.voiceSection) return;
+  const chat = state.chatDetail;
+  clear(refs.voiceSection);
+  if (!chat || chat.type === 'dialog') return;
+
+  const rooms = (chat.voice || []).map((r) => ({
+    ...r,
+    participants: [...(state.voiceRoomsLive.get(r.id) || new Map()).values()],
+  }));
+  const manage = canManageVoice(chat);
+  if (!rooms.length && !manage) return;
+
+  refs.voiceSection.append(el('div', { class: 'voice-head' },
+    icon('speaker', 14),
+    el('span', null, 'Голосовые каналы'),
+    rooms.length ? el('span', { class: 'voice-head__count' }, String(rooms.length)) : null,
+    manage ? el('button', {
+      class: 'voice-head__add', title: 'Создать голосовой канал',
+      onclick: addVoiceRoomFlow,
+    }, icon('plus', 13)) : null,
+  ));
+
+  const list = el('div', { class: 'voice-rooms' });
+  for (const room of rooms) {
+    const active = state.voice && state.voice.roomId === room.id;
+    list.append(el('div', {
+      class: 'voice-room' + (active ? ' voice-room--active' : ''),
+      onclick: () => toggleVoiceRoom(room),
+    },
+      el('span', { class: 'voice-room__icon' }, icon('volume', 15)),
+      el('span', { class: 'voice-room__name' }, room.name),
+      el('span', { class: 'voice-room__parts' },
+        room.participants.map((p) => el('span', {
+          class: 'voice-part' + (p.muted ? ' voice-part--muted' : ''),
+          title: voiceUserName(p.userId) + (p.muted ? ' · микрофон выключен' : ' · говорит'),
+        }, avatar({ id: p.userId, name: voiceUserName(p.userId) }, { size: 22, dot: false }),
+          p.muted ? el('span', { class: 'voice-part__mute' }, icon('micOff', 9)) : null)),
+        room.participants.length === 0 && active ? el('span', { class: 'voice-part__solo' }, 'вы') : null,
+      ),
+      manage ? el('button', {
+        class: 'voice-room__del', title: 'Удалить канал',
+        onclick: (e) => { e.stopPropagation(); deleteVoiceRoomFlow(room); },
+      }, icon('x', 12)) : null,
+    ));
+  }
+  refs.voiceSection.append(list);
+}
+
+async function toggleVoiceRoom(room) {
+  const v = state.voice;
+  if (!v) return;
+  if (v.roomId === room.id) {
+    try { await v.leave(); } catch (_) { /* noop */ }
+    return; // перерисуемся по событиям onEnded
+  }
+  try {
+    await v.join(state.chatDetail.id, room.id, room.name);
+    if (v.listenOnly) toast('Микрофон недоступен — вы вошли в режиме слушателя 🎧');
+    renderVoiceSection();
+    renderCallPanel();
+  } catch (err) {
+    toast(err.message || 'Не удалось подключиться к голосовому каналу', 'error');
+  }
+}
+
+function addVoiceRoomFlow() {
+  const input = el('input', { class: 'input', placeholder: 'Например: «Общий войс»', maxlength: '32', autocomplete: 'off' });
+  const errEl = el('div', { class: 'field-error' });
+  const btn = el('button', { class: 'btn btn--primary btn--block' }, 'Создать канал');
+  const m = modal({
+    title: 'Новый голосовой канал',
+    content: el('div', { class: 'form' },
+      mkFieldWrap('Название', input),
+      el('div', { class: 'form__hint' }, 'Участники смогут заходить в канал и говорить друг с другом в реальном времени — как в Discord.'),
+      errEl,
+      btn,
+    ),
+  });
+  async function submit() {
+    const name = input.value.trim();
+    if (!name) { errEl.textContent = 'Укажите название'; return; }
+    btn.disabled = true;
+    try {
+      await api.post(`/api/chats/${state.chatDetail.id}/voice-rooms`, { name });
+      const res = await api.get('/api/chats/' + state.chatDetail.id);
+      state.chatDetail = res.chat;
+      renderVoiceSection();
+      m.close();
+      toast('Голосовой канал «' + name + '» создан 🔊', 'success');
+    } catch (err) {
+      errEl.textContent = err.message;
+      btn.disabled = false;
+    }
+  }
+  btn.addEventListener('click', submit);
+  setTimeout(() => input.focus(), 50);
+}
+
+async function deleteVoiceRoomFlow(room) {
+  const ok = await confirmModal({
+    title: 'Удалить голосовой канал?',
+    text: '«' + room.name + '» исчезнет, а все участники будут отключены.',
+    confirmLabel: 'Удалить',
+  });
+  if (!ok) return;
+  try {
+    await api.del(`/api/chats/${state.chatDetail.id}/voice-rooms/${room.id}`);
+    if (state.voice && state.voice.roomId === room.id) {
+      try { await state.voice.leave(); } catch (_) { /* noop */ }
+    }
+    const res = await api.get('/api/chats/' + state.chatDetail.id);
+    state.chatDetail = res.chat;
+    renderVoiceSection();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+function renderCallPanel() {
+  if (refs.callPanel) {
+    refs.callPanel.remove();
+    refs.callPanel = null;
+  }
+  state.callAvatars = {};
+  const v = state.voice;
+  if (!v || !v.active || !refs.root) return;
+
+  const parts = [...(state.voiceRoomsLive.get(v.roomId) || new Map()).values()];
+  if (!parts.some((p) => p.cid === v.cid)) {
+    parts.push({ cid: v.cid, userId: state.user.id, muted: v.muted });
+  }
+
+  const users = el('div', { class: 'call-panel__users' });
+  for (const p of parts) {
+    const wrap = el('div', {
+      class: 'call-avatar' + (p.muted ? ' call-avatar--muted' : ''),
+      title: voiceUserName(p.userId),
+    },
+      avatar({ id: p.userId, name: voiceUserName(p.userId) }, { size: 38, dot: false }),
+      p.muted ? el('span', { class: 'call-avatar__mute' }, icon('micOff', 11)) : null,
+    );
+    state.callAvatars[p.cid] = wrap;
+    users.append(wrap);
+  }
+
+  const micBtn = el('button', {
+    class: 'call-ctrl' + (v.muted && !v.listenOnly ? ' call-ctrl--active' : ''),
+    title: v.listenOnly ? 'Микрофон недоступен' : (v.muted ? 'Включить микрофон' : 'Выключить микрофон'),
+    onclick: async () => {
+      if (v.listenOnly) { toast('Микрофон недоступен — режим слушателя', 'error'); return; }
+      await v.setMuted(!v.muted);
+      renderCallPanel();
+    },
+  }, icon(v.muted || v.listenOnly ? 'micOff' : 'mic', 18));
+
+  refs.callPanel = el('div', { class: 'call-panel' },
+    el('div', { class: 'call-panel__head' },
+      icon('volume', 15),
+      el('span', { class: 'call-panel__name' }, v.roomName || 'Голосовой канал'),
+      el('span', { class: 'call-panel__count' },
+        parts.length + ' ' + plural(parts.length, ['на связи', 'на связи', 'на связи'])),
+    ),
+    users,
+    el('div', { class: 'call-panel__ctrls' },
+      micBtn,
+      el('button', {
+        class: 'call-ctrl call-ctrl--danger', title: 'Покинуть канал',
+        onclick: async () => { try { await v.leave(); } catch (_) { /* noop */ } },
+      }, icon('x', 18)),
+    ),
+  );
+  refs.root.append(refs.callPanel);
+}
+
+// ============================================================
+//  Админ-панель
+// ============================================================
+
+function openAdminPanel() {
+  const m = modal({ title: 'Админ-панель Pulse', wide: true });
+  m.root.classList.add('overlay--admin');
+
+  const tabsBar = el('div', { class: 'tabs tabs--admin' });
+  const content = el('div', { class: 'admin__content' });
+  m.body.append(tabsBar, content);
+
+  const TABS = [
+    ['overview', 'Обзор'],
+    ['users', 'Пользователи'],
+    ['chats', 'Чаты'],
+    ['broadcast', 'Объявление'],
+  ];
+  const btns = {};
+  const loaders = {};
+
+  function switchTab(id) {
+    for (const [tid, b] of Object.entries(btns)) b.classList.toggle('tab--active', tid === id);
+    clear(content);
+    loaders[id]();
+  }
+  for (const [id, label] of TABS) {
+    btns[id] = el('button', { class: 'tab', type: 'button', onclick: () => switchTab(id) }, label);
+    tabsBar.append(btns[id]);
+  }
+
+  loaders.overview = async () => {
+    content.append(el('div', { class: 'picker-empty' }, 'Загрузка…'));
+    try {
+      const d = await api.get('/api/admin/overview');
+      clear(content);
+      const s = d.stats;
+      content.append(el('div', { class: 'stat-grid' },
+        statCard('user', s.users, 'Пользователей'),
+        statCard('logo', s.online, 'В сети'),
+        statCard('users', s.chats, 'Чатов'),
+        statCard('send', s.messages, 'Сообщений'),
+        statCard('volume', s.voice, 'В голосовых'),
+        statCard('shield', s.admins, 'Админов'),
+      ));
+      content.append(el('div', { class: 'chatinfo__section-title', style: 'padding-left:2px' }, 'Новые пользователи'));
+      const list = el('div', { class: 'admin-list' });
+      for (const u of d.recent) {
+        list.append(el('div', { class: 'admin-row' },
+          avatar({ id: u.id, name: u.nickname, online: u.online }, { size: 36 }),
+          el('div', { class: 'admin-row__info' },
+            el('span', { class: 'admin-row__name' },
+              u.nickname,
+              u.isAdmin ? el('span', { class: 'badge badge--admin' }, 'админ') : null,
+              u.banned ? el('span', { class: 'badge badge--banned' }, 'бан') : null),
+            el('span', { class: 'admin-row__sub' }, '@' + u.username + ' · ' + u.email),
+          ),
+        ));
+      }
+      content.append(list);
+    } catch (err) {
+      clear(content);
+      content.append(el('div', { class: 'picker-empty' }, err.message));
+    }
+  };
+
+  loaders.users = async () => {
+    content.append(el('div', { class: 'picker-empty' }, 'Загрузка…'));
+    try {
+      const d = await api.get('/api/admin/users');
+      clear(content);
+      const list = el('div', { class: 'admin-list' });
+      for (const u of d.users) list.append(adminUserRow(u, () => switchTab('users')));
+      content.append(list);
+    } catch (err) {
+      clear(content);
+      content.append(el('div', { class: 'picker-empty' }, err.message));
+    }
+  };
+
+  loaders.chats = async () => {
+    content.append(el('div', { class: 'picker-empty' }, 'Загрузка…'));
+    try {
+      const d = await api.get('/api/admin/chats');
+      clear(content);
+      if (!d.chats.length) {
+        content.append(el('div', { class: 'picker-empty' }, 'Чатов пока нет'));
+        return;
+      }
+      const list = el('div', { class: 'admin-list' });
+      for (const c of d.chats) {
+        list.append(el('div', { class: 'admin-row' },
+          avatar({ id: c.id, name: c.title || 'Чат', type: c.type }, { size: 40, typeIcon: true }),
+          el('div', { class: 'admin-row__info' },
+            el('span', { class: 'admin-row__name' }, c.title || 'Чат',
+              el('span', { class: 'badge badge--type' },
+                c.type === 'dialog' ? 'личный' : c.type === 'channel' ? 'канал' : 'группа')),
+            el('span', { class: 'admin-row__sub' },
+              c.memberCount + ' ' + plural(c.memberCount, ['участник', 'участника', 'участников']) +
+              ' · ' + c.messageCount + ' ' + plural(c.messageCount, ['сообщение', 'сообщения', 'сообщений']) +
+              (c.voiceRooms ? ' · 🔊 ' + c.voiceRooms : '') +
+              ' · ' + fmtListTime(c.lastActivity)),
+          ),
+          el('button', {
+            class: 'btn btn--sm btn--danger',
+            onclick: async () => {
+              const ok = await confirmModal({
+                title: 'Удалить чат?',
+                text: '«' + (c.title || 'Чат') + '» будет удалён вместе с историей.',
+                confirmLabel: 'Удалить',
+              });
+              if (!ok) return;
+              try {
+                await api.del('/api/admin/chats/' + c.id);
+                switchTab('chats');
+                loadChats();
+              } catch (err) { toast(err.message, 'error'); }
+            },
+          }, 'Удалить'),
+        ));
+      }
+      content.append(list);
+    } catch (err) {
+      clear(content);
+      content.append(el('div', { class: 'picker-empty' }, err.message));
+    }
+  };
+
+  loaders.broadcast = () => {
+    const ta = el('textarea', {
+      class: 'input input--area',
+      placeholder: 'Текст объявления — он появится в канале «Pulse · Новости» у всех пользователей',
+      maxlength: '2000',
+    });
+    const btn = el('button', { class: 'btn btn--primary' }, icon('megaphone', 16), 'Отправить объявление');
+    btn.addEventListener('click', async () => {
+      const text = ta.value.trim();
+      if (!text) { toast('Введите текст объявления', 'error'); return; }
+      btn.disabled = true;
+      try {
+        await api.post('/api/admin/broadcast', { text });
+        ta.value = '';
+        toast('Объявление отправлено 📣', 'success');
+      } catch (err) {
+        toast(err.message, 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    content.append(
+      el('p', { class: 'modal__text' }, 'Объявление публикуется от имени Pulse в официальном канале новостей и мгновенно доставляется всем пользователям.'),
+      ta,
+      el('div', { class: 'modal__actions' }, btn),
+    );
+  };
+
+  switchTab('overview');
+}
+
+function statCard(ic, value, label) {
+  return el('div', { class: 'stat-card' },
+    el('span', { class: 'stat-card__icon' }, icon(ic, 18)),
+    el('span', { class: 'stat-card__value' }, String(value)),
+    el('span', { class: 'stat-card__label' }, label),
+  );
+}
+
+function adminUserRow(u, refresh) {
+  const isMe = u.id === state.user.id;
+  const isCoffin = u.username === 'coffin';
+  const actions = el('div', { class: 'admin__actions' });
+
+  if (!isMe && !isCoffin) {
+    if (u.banned) {
+      actions.append(el('button', {
+        class: 'btn btn--sm btn--ghost',
+        onclick: async () => { try { await api.post(`/api/admin/users/${u.id}/unban`); refresh(); } catch (err) { toast(err.message, 'error'); } },
+      }, 'Разбанить'));
+    } else if (!u.isAdmin) {
+      actions.append(el('button', {
+        class: 'btn btn--sm btn--danger',
+        onclick: async () => {
+          const ok = await confirmModal({
+            title: 'Заблокировать пользователя?',
+            text: u.nickname + ' потеряет доступ к мессенджеру.',
+            confirmLabel: 'Заблокировать',
+          });
+          if (!ok) return;
+          try { await api.post(`/api/admin/users/${u.id}/ban`); refresh(); } catch (err) { toast(err.message, 'error'); }
+        },
+      }, 'Бан'));
+    }
+    if (!u.isAdmin) {
+      actions.append(el('button', {
+        class: 'btn btn--sm btn--ghost',
+        onclick: async () => { try { await api.post(`/api/admin/users/${u.id}/promote`); refresh(); } catch (err) { toast(err.message, 'error'); } },
+      }, 'Выдать админа'));
+    } else {
+      actions.append(el('button', {
+        class: 'btn btn--sm btn--ghost',
+        onclick: async () => { try { await api.post(`/api/admin/users/${u.id}/demote`); refresh(); } catch (err) { toast(err.message, 'error'); } },
+      }, 'Снять админа'));
+    }
+  }
+
+  return el('div', { class: 'admin-row' },
+    avatar({ id: u.id, name: u.nickname, online: u.online }, { size: 40 }),
+    el('div', { class: 'admin-row__info' },
+      el('span', { class: 'admin-row__name' },
+        u.nickname + (isMe ? ' (вы)' : ''),
+        u.isAdmin ? el('span', { class: 'badge badge--admin' }, isCoffin ? 'главный админ' : 'админ') : null,
+        u.banned ? el('span', { class: 'badge badge--banned' }, 'заблокирован') : null,
+        u.online ? el('span', { class: 'badge badge--online' }, 'онлайн') : null),
+      el('span', { class: 'admin-row__sub' }, '@' + u.username + ' · ' + u.email),
+    ),
+    actions,
+  );
+}
+
+// ============================================================
 //  Утилиты
 // ============================================================
 
@@ -1458,3 +1956,11 @@ function plural(n, forms) {
   if (d === 1) return forms[0];
   return forms[2];
 }
+
+function genCid() {
+  try {
+    if (crypto.randomUUID) return crypto.randomUUID();
+  } catch (_) { /* noop */ }
+  return 'cid-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+}
+

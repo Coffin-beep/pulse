@@ -27,6 +27,41 @@ function broadcast(event, exceptUserId) {
   }
 }
 
+// рассылка только участникам конкретного чата
+function broadcastToChat(chatId, event) {
+  const chat = storage.getChat(chatId);
+  if (!chat) return;
+  for (const c of sseClients) {
+    if (chat.members[c.userId]) sseSend(c, event);
+  }
+}
+
+function sendToCid(cid, event) {
+  for (const c of sseClients) {
+    if (c.cid === cid) {
+      sseSend(c, event);
+      return true;
+    }
+  }
+  return false;
+}
+
+function clientByCid(cid) {
+  for (const c of sseClients) {
+    if (c.cid === cid) return c;
+  }
+  return null;
+}
+
+function kickSseUser(userId) {
+  for (const c of [...sseClients]) {
+    if (c.userId === userId) {
+      sseClients.delete(c);
+      try { c.res.end(); } catch (_) { /* noop */ }
+    }
+  }
+}
+
 function onlineUserIds() {
   const set = new Set();
   for (const c of sseClients) set.add(c.userId);
@@ -43,6 +78,59 @@ function initPresence() {
       }
     }
   }, 25000).unref();
+}
+
+// ============================================================
+//  Голосовые комнаты (Discord-style, WebRTC-меш)
+//  roomId -> Map(cid -> { userId, chatId, muted })
+// ============================================================
+
+const voiceRooms = new Map();
+
+function findChatByRoomId(roomId) {
+  return storage.allChats().find((c) => (c.voiceRooms || []).some((r) => r.id === roomId)) || null;
+}
+
+function voiceRoomView(chat) {
+  return (chat.voiceRooms || []).map((r) => {
+    const participants = [];
+    const m = voiceRooms.get(r.id);
+    if (m) {
+      for (const [cid, p] of m) participants.push({ cid, userId: p.userId, muted: p.muted });
+    }
+    return { id: r.id, name: r.name, participants };
+  });
+}
+
+function voiceParticipantsTotal() {
+  let n = 0;
+  for (const m of voiceRooms.values()) n += m.size;
+  return n;
+}
+
+// отключить соединение cid от всех голосовых комнат
+function leaveVoiceCid(cid) {
+  for (const [roomId, m] of voiceRooms) {
+    const p = m.get(cid);
+    if (!p) continue;
+    m.delete(cid);
+    if (!m.size) voiceRooms.delete(roomId);
+    broadcastToChat(p.chatId, {
+      type: 'voice_state', chatId: p.chatId, roomId,
+      connId: cid, userId: p.userId, action: 'leave',
+    });
+  }
+}
+
+// выкинуть всех из комнаты (при удалении комнаты/чата)
+function kickRoom(roomId, chatId) {
+  const m = voiceRooms.get(roomId);
+  if (!m) return;
+  for (const cid of [...m.keys()]) {
+    m.delete(cid);
+    sendToCid(cid, { type: 'voice_state', chatId, roomId, connId: cid, action: 'kick' });
+  }
+  voiceRooms.delete(roomId);
 }
 
 // ============================================================
@@ -63,7 +151,14 @@ function getAuthUser(req, url) {
 function requireAuth(req, url) {
   const user = getAuthUser(req, url);
   if (!user) throw new ApiError(401, 'Требуется авторизация');
+  if (user.banned) throw new ApiError(403, 'Аккаунт заблокирован администратором');
   return user;
+}
+
+function requireAdmin(req, url) {
+  const me = requireAuth(req, url);
+  if (!me.isAdmin) throw new ApiError(403, 'Доступ только для администраторов');
+  return me;
 }
 
 function getChatOr404(id) {
@@ -115,8 +210,16 @@ function chatView(chat, viewerId, online) {
     memberCount: memberIds.length,
     onlineCount: memberIds.filter((id) => online.has(id)).length,
     peer,
+    voice: chat.type === 'dialog' ? [] : voiceRoomView(chat),
     createdAt: chat.createdAt,
   };
+}
+
+// полное удаление чата: выкинуть из голосовых, удалить файлы, разослать события
+function deleteChatFully(chat) {
+  for (const r of chat.voiceRooms || []) kickRoom(r.id, chat.id);
+  storage.deleteChat(chat.id);
+  broadcast({ type: 'chat_deleted', chatId: chat.id });
 }
 
 function chatDetail(chat, viewerId, online) {
@@ -278,11 +381,10 @@ async function route(req, res, url) {
       requireMember(chat, me.id);
       if (chat.type === 'dialog') {
         // любой из двоих может удалить личный чат
-      } else if (chat.ownerId !== me.id) {
+      } else if (chat.ownerId !== me.id && !me.isAdmin) {
         throw new ApiError(403, 'Удалить чат может только владелец');
       }
-      storage.deleteChat(chat.id);
-      broadcast({ type: 'chat_deleted', chatId: chat.id });
+      deleteChatFully(chat);
       return sendJSON(res, 200, { ok: true });
     }
 
@@ -346,6 +448,35 @@ async function route(req, res, url) {
       return sendJSON(res, 200, { chat: chatDetail(chat, me.id, onlineUserIds()) });
     }
 
+    // POST /api/chats/:id/voice-rooms — создать голосовой канал
+    if (sub === 'voice-rooms' && p.length === 3 && method === 'POST') {
+      requireCanManage(chat, me.id);
+      if (chat.type === 'dialog') throw new ApiError(400, 'Голосовые каналы доступны в группах и каналах');
+      const body = await readJsonBody(req);
+      const name = String(body.name || '').trim();
+      if (!name || name.length > 32) throw new ApiError(400, 'Название: 1–32 символа', 'name');
+      if ((chat.voiceRooms || []).length >= 20) throw new ApiError(400, 'Слишком много голосовых каналов');
+      const room = { id: storage.newId('v'), name, createdAt: Date.now() };
+      chat.voiceRooms = chat.voiceRooms || [];
+      chat.voiceRooms.push(room);
+      storage.updateChat(chat, {});
+      broadcast({ type: 'chat_updated', chatId: chat.id });
+      return sendJSON(res, 201, { room });
+    }
+
+    // DELETE /api/chats/:id/voice-rooms/:roomId — удалить голосовой канал
+    if (sub === 'voice-rooms' && p.length === 4 && method === 'DELETE') {
+      requireCanManage(chat, me.id);
+      const roomId = p[3];
+      const i = (chat.voiceRooms || []).findIndex((r) => r.id === roomId);
+      if (i === -1) throw new ApiError(404, 'Голосовой канал не найден');
+      chat.voiceRooms.splice(i, 1);
+      storage.updateChat(chat, {});
+      kickRoom(roomId, chat.id);
+      broadcast({ type: 'chat_updated', chatId: chat.id });
+      return sendJSON(res, 200, { ok: true });
+    }
+
     // GET/POST /api/chats/:id/messages
     if (sub === 'messages' && p.length === 3) {
       requireMember(chat, me.id);
@@ -381,7 +512,7 @@ async function route(req, res, url) {
       const store = storage.messageStore(chat.id);
       const target = store.items.find((m) => m.id === Number(p[3]));
       if (!target) throw new ApiError(404, 'Сообщение не найдено');
-      const isModerator = chat.type !== 'dialog' && (my.role === 'owner' || my.role === 'admin');
+      const isModerator = me.isAdmin || (chat.type !== 'dialog' && (my.role === 'owner' || my.role === 'admin'));
       if (target.senderId !== me.id && !isModerator) {
         throw new ApiError(403, 'Можно удалять только свои сообщения');
       }
@@ -470,6 +601,182 @@ async function route(req, res, url) {
     return sendJSON(res, 200, { items });
   }
 
+  // ---------- голосовые комнаты: вход / выход / состояние / сигналы ----------
+
+  if (p[0] === 'voice' && p.length === 3 && p[2] === 'join' && method === 'POST') {
+    const me = requireAuth(req, url);
+    const roomId = p[1];
+    const chat = findChatByRoomId(roomId);
+    if (!chat) throw new ApiError(404, 'Голосовой канал не найден');
+    requireMember(chat, me.id);
+    const body = await readJsonBody(req);
+    const cid = String(body.cid || '');
+    const client = clientByCid(cid);
+    if (!client || client.userId !== me.id) {
+      throw new ApiError(409, 'Нет живого соединения — обновите страницу');
+    }
+    leaveVoiceCid(cid); // если уже был в другой комнате — выходим
+    let m = voiceRooms.get(roomId);
+    if (!m) {
+      m = new Map();
+      voiceRooms.set(roomId, m);
+    }
+    m.set(cid, { userId: me.id, chatId: chat.id, muted: false });
+    const peers = [];
+    for (const [c, pp] of m) {
+      if (c !== cid) peers.push({ cid: c, userId: pp.userId, muted: pp.muted });
+    }
+    broadcastToChat(chat.id, {
+      type: 'voice_state', chatId: chat.id, roomId,
+      connId: cid, userId: me.id, muted: false, action: 'join',
+    });
+    return sendJSON(res, 200, { roomId, chatId: chat.id, me: cid, peers });
+  }
+
+  if (p[0] === 'voice' && p.length === 3 && p[2] === 'leave' && method === 'POST') {
+    const me = requireAuth(req, url);
+    const body = await readJsonBody(req);
+    const cid = String(body.cid || '');
+    const client = clientByCid(cid);
+    if (!client || client.userId !== me.id) throw new ApiError(409, 'Нет живого соединения');
+    leaveVoiceCid(cid);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (p[0] === 'voice' && p.length === 3 && p[2] === 'state' && method === 'POST') {
+    const me = requireAuth(req, url);
+    const roomId = p[1];
+    const body = await readJsonBody(req);
+    const cid = String(body.cid || '');
+    const m = voiceRooms.get(roomId);
+    const ent = m && m.get(cid);
+    if (!ent || ent.userId !== me.id) throw new ApiError(404, 'Вы не в этой комнате');
+    ent.muted = !!body.muted;
+    broadcastToChat(ent.chatId, {
+      type: 'voice_state', chatId: ent.chatId, roomId,
+      connId: cid, userId: me.id, muted: ent.muted, action: 'state',
+    });
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (p[0] === 'voice' && p.length === 3 && p[2] === 'signal' && method === 'POST') {
+    const me = requireAuth(req, url);
+    const roomId = p[1];
+    const body = await readJsonBody(req);
+    const cid = String(body.cid || '');
+    const m = voiceRooms.get(roomId);
+    const ent = m && m.get(cid);
+    if (!ent || ent.userId !== me.id) throw new ApiError(404, 'Вы не в этой комнате');
+    const to = String(body.to || '');
+    if (!m.has(to)) throw new ApiError(404, 'Адресат не в комнате');
+    sendToCid(to, { type: 'voice_signal', roomId, from: cid, userId: me.id, data: body.data });
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  // ---------- админ-панель ----------
+
+  if (p[0] === 'admin' && p[1] === 'overview' && method === 'GET') {
+    requireAdmin(req, url);
+    const users = storage.allUsers();
+    let messages = 0;
+    for (const c of storage.allChats()) messages += storage.messageStore(c.id).items.length;
+    const recent = users
+      .slice()
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, 6)
+      .map((u) => storage.publicUser(u, { email: u.email, online: onlineUserIds().has(u.id) }));
+    return sendJSON(res, 200, {
+      stats: {
+        users: users.length,
+        banned: users.filter((u) => u.banned).length,
+        admins: users.filter((u) => u.isAdmin).length,
+        online: onlineUserIds().size,
+        chats: storage.allChats().length,
+        messages,
+        voice: voiceParticipantsTotal(),
+      },
+      recent,
+    });
+  }
+
+  if (p[0] === 'admin' && p[1] === 'users' && method === 'GET') {
+    requireAdmin(req, url);
+    const online = onlineUserIds();
+    const users = storage.allUsers()
+      .slice()
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map((u) => storage.publicUser(u, { email: u.email, online: online.has(u.id) }));
+    return sendJSON(res, 200, { users });
+  }
+
+  if (p[0] === 'admin' && p[1] === 'users' && p.length === 4 && method === 'POST') {
+    const me = requireAdmin(req, url);
+    const action = p[3];
+    if (!['ban', 'unban', 'promote', 'demote'].includes(action)) throw new ApiError(404, 'Не найдено');
+    const target = storage.getUser(p[2]);
+    if (!target) throw new ApiError(404, 'Пользователь не найден');
+    if (target.id === me.id) throw new ApiError(400, 'Нельзя менять свой аккаунт');
+    if (target.username === 'coffin') throw new ApiError(403, 'Главного администратора (@coffin) нельзя изменить');
+
+    if (action === 'ban') {
+      if (target.isAdmin) throw new ApiError(403, 'Администратора нельзя заблокировать');
+      storage.updateUser(target.id, { banned: true });
+      storage.deleteSessionsForUser(target.id);
+      kickSseUser(target.id);
+    } else if (action === 'unban') {
+      storage.updateUser(target.id, { banned: false });
+    } else if (action === 'promote') {
+      storage.updateUser(target.id, { isAdmin: true, banned: false });
+    } else {
+      storage.updateUser(target.id, { isAdmin: false });
+    }
+    broadcast({ type: 'user_updated', userId: target.id });
+    return sendJSON(res, 200, { user: storage.publicUser(target, { email: target.email }) });
+  }
+
+  if (p[0] === 'admin' && p[1] === 'chats' && method === 'GET') {
+    requireAdmin(req, url);
+    const chats = storage.allChats()
+      .map((c) => {
+        const lm = storage.lastMessage(c.id);
+        return {
+          id: c.id,
+          type: c.type,
+          title: c.type === 'dialog'
+            ? Object.keys(c.members).map((id) => (storage.getUser(id) || {}).nickname).join(' · ')
+            : c.title,
+          privacy: c.privacy,
+          memberCount: Object.keys(c.members).length,
+          messageCount: storage.messageStore(c.id).items.length,
+          voiceRooms: (c.voiceRooms || []).length,
+          lastActivity: (lm && lm.createdAt) || c.createdAt,
+        };
+      })
+      .sort((a, b) => b.lastActivity - a.lastActivity);
+    return sendJSON(res, 200, { chats });
+  }
+
+  if (p[0] === 'admin' && p[1] === 'chats' && p.length === 3 && method === 'DELETE') {
+    requireAdmin(req, url);
+    const chat = getChatOr404(p[2]);
+    deleteChatFully(chat);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  if (p[0] === 'admin' && p[1] === 'broadcast' && method === 'POST') {
+    const me = requireAdmin(req, url);
+    const body = await readJsonBody(req);
+    const text = String(body.text || '').trim();
+    if (!text || text.length > 2000) throw new ApiError(400, 'Текст объявления: 1–2000 символов');
+    const news = getNewsChannel();
+    const msg = storage.addMessage(news.id, news.ownerId, {
+      type: 'text',
+      text: '📣 Объявление от @' + me.username + ':\n' + text,
+    });
+    broadcast({ type: 'new_message', chatId: news.id });
+    return sendJSON(res, 201, { message: msg });
+  }
+
   // ---------- SSE ----------
 
   if (p[0] === 'events' && method === 'GET') {
@@ -511,7 +818,7 @@ async function handleRegister(req, res) {
     throw new ApiError(400, 'Пароль должен быть не короче 6 символов', 'password');
   }
 
-  const user = storage.createUser({ username, nickname, email, password });
+  const user = storage.createUser({ username, nickname, email, password, isAdmin: username === 'coffin' });
 
   // автоматически подписываем новостной канал Pulse
   const news = getNewsChannel();
@@ -536,6 +843,7 @@ async function handleLogin(req, res) {
   if (!user) throw new ApiError(401, 'Неверный логин или пароль');
   const hash = storage.hashPassword(password, user.salt);
   if (hash !== user.passwordHash) throw new ApiError(401, 'Неверный логин или пароль');
+  if (user.banned) throw new ApiError(403, 'Аккаунт заблокирован администратором');
 
   const token = storage.createSession(user.id);
   return sendJSON(res, 200, { token, user: storage.publicUser(user, { online: true }) });
@@ -577,6 +885,9 @@ async function handleCreateChat(req, res, me) {
 function handleEvents(req, res, url) {
   const user = getAuthUser(req, url);
   if (!user) throw new ApiError(401, 'Требуется авторизация');
+  if (user.banned) throw new ApiError(403, 'Аккаунт заблокирован администратором');
+
+  const cid = url.searchParams.get('cid') || storage.newId('cid');
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -585,9 +896,9 @@ function handleEvents(req, res, url) {
     'X-Accel-Buffering': 'no',
   });
   res.write('retry: 2000\n\n');
-  res.write(`data: ${JSON.stringify({ type: 'hello' })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: 'hello', cid })}\n\n`);
 
-  const client = { userId: user.id, res };
+  const client = { userId: user.id, cid, res };
   const wasOnline = onlineUserIds().has(user.id);
   sseClients.add(client);
   if (!wasOnline) {
@@ -596,6 +907,7 @@ function handleEvents(req, res, url) {
 
   req.on('close', () => {
     sseClients.delete(client);
+    leaveVoiceCid(cid);
     if (!onlineUserIds().has(user.id)) {
       broadcast({ type: 'presence', userId: user.id, online: false });
     }

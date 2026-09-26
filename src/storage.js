@@ -45,6 +45,17 @@ const db = {
 
 const messageCache = new Map(); // chatId -> { seq, items }
 
+// миграции: флаги админа/бана; @coffin — главный админ мессенджера
+(function migrate() {
+  let changed = false;
+  for (const u of Object.values(db.users.items)) {
+    if (u.isAdmin === undefined) { u.isAdmin = false; changed = true; }
+    if (u.banned === undefined) { u.banned = false; changed = true; }
+    if (u.username === 'coffin' && !u.isAdmin) { u.isAdmin = true; changed = true; }
+  }
+  if (changed) saveUsers();
+})();
+
 function saveUsers() { writeJSON(USERS_FILE, db.users, true); }
 function saveChats() { writeJSON(CHATS_FILE, db.chats, true); }
 function saveSessions() { writeJSON(SESSIONS_FILE, db.sessions, true); }
@@ -85,7 +96,7 @@ function hashPassword(password, salt) {
   return crypto.scryptSync(String(password), salt, 64).toString('hex');
 }
 
-function createUser({ username, nickname, email, password }) {
+function createUser({ username, nickname, email, password, isAdmin }) {
   const salt = crypto.randomBytes(16).toString('hex');
   const user = {
     id: newId('u'),
@@ -94,6 +105,8 @@ function createUser({ username, nickname, email, password }) {
     email: normalizeEmail(email),
     salt,
     passwordHash: hashPassword(password, salt),
+    isAdmin: !!isAdmin,
+    banned: false,
     bio: '',
     createdAt: Date.now(),
   };
@@ -117,6 +130,8 @@ function publicUser(user, extra) {
     username: user.username,
     nickname: user.nickname,
     bio: user.bio || '',
+    isAdmin: !!user.isAdmin,
+    banned: !!user.banned,
     createdAt: user.createdAt,
     ...(extra || {}),
   };
@@ -143,6 +158,17 @@ function deleteSession(token) {
     delete db.sessions.items[token];
     saveSessions();
   }
+}
+
+function deleteSessionsForUser(userId) {
+  let changed = false;
+  for (const token of Object.keys(db.sessions.items)) {
+    if (db.sessions.items[token].userId === userId) {
+      delete db.sessions.items[token];
+      changed = true;
+    }
+  }
+  if (changed) saveSessions();
 }
 
 // ---- chats ----
@@ -173,6 +199,7 @@ function createChat({ type, title = '', description = '', privacy = 'private', o
     privacy: type === 'dialog' ? 'private' : (privacy === 'public' ? 'public' : 'private'),
     ownerId,
     members: {},
+    voiceRooms: [],
     createdAt: Date.now(),
   };
 
@@ -316,6 +343,7 @@ module.exports = {
   createSession,
   getSessionUser,
   deleteSession,
+  deleteSessionsForUser,
   allChats,
   getChat,
   findDialog,

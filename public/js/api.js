@@ -76,7 +76,7 @@ export function fileUrl(file) {
 }
 
 // Живые обновления через Server-Sent Events
-export function connectEvents(onEvent) {
+export function connectEvents(onEvent, cid) {
   let closed = false;
   let es = null;
 
@@ -84,7 +84,9 @@ export function connectEvents(onEvent) {
     if (closed) return;
     const token = getToken();
     if (!token) return;
-    es = new EventSource('/api/events?token=' + encodeURIComponent(token));
+    const qs = new URLSearchParams({ token });
+    if (cid) qs.set('cid', cid);
+    es = new EventSource('/api/events?' + qs.toString());
     es.onmessage = (e) => {
       try { onEvent(JSON.parse(e.data)); } catch (_) { /* noop */ }
     };
