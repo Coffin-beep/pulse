@@ -18,6 +18,18 @@
       <div class="boot-splash__text">Pulse</div>
     </div>
   </div>
+  <script>
+    // если через 7 секунд приложение не загрузилось — подсказка вместо вечного сплэша
+    setTimeout(function () {
+      if (!window.__pulseBooted) {
+        var splash = document.querySelector('.boot-splash');
+        if (splash) {
+          splash.insertAdjacentHTML('beforeend',
+            '<div class="boot-splash__hint">Сервер не отвечает.<br>Проверь, что он запущен (node server.js), и обнови страницу</div>');
+        }
+      }
+    }, 7000);
+  </script>
   <noscript>
     <div style="position:fixed;inset:0;display:grid;place-items:center;background:#120e1d;color:#ece8f8;font-family:sans-serif;padding:24px;text-align:center">
       Для работы Pulse нужен включённый JavaScript 🙏

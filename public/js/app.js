@@ -45,18 +45,46 @@ window.addEventListener('pulse:logout', () => showAuth(true));
 loadSettings();
 applySettings();
 
-(async function boot() {
+async function boot() {
+  window.__pulseBooted = true;
   if (getToken()) {
     try {
       state.user = await api.get('/api/me');
       showApp();
       return;
-    } catch (_) {
+    } catch (e) {
+      if (e && e.status === 0) { showOffline(); return; } // сервер недоступен
       setToken(null);
     }
   }
   showAuth();
-})();
+}
+
+// Экран «нет связи»: сервер не отвечает, но приложение загрузилось
+function showOffline() {
+  clear($app);
+  $app.appendChild(el('div', { class: 'auth' },
+    el('div', { class: 'auth__bg' },
+      el('span', { class: 'blob blob--1' }),
+      el('span', { class: 'blob blob--2' }),
+      el('span', { class: 'blob blob--3' }),
+    ),
+    el('div', { class: 'auth__card' },
+      el('div', { class: 'auth__logo' },
+        el('div', { class: 'auth__mark' }, icon('logo', 36)),
+        el('h1', { class: 'auth__title' }, 'Pulse'),
+        el('p', { class: 'auth__sub' }, 'Не удалось связаться с сервером 😔'),
+      ),
+      el('p', { class: 'auth__note' }, 'Проверь, что сервер запущен, и попробуй ещё раз'),
+      el('button', {
+        class: 'btn btn--primary btn--block',
+        onclick: () => { boot(); },
+      }, 'Повторить'),
+    ),
+  ));
+}
+
+boot();
 
 // ============================================================
 //  Экран входа / регистрации
