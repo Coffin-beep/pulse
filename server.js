@@ -3,6 +3,7 @@
 const http = require('http');
 const { handleApi, initPresence } = require('./src/api');
 const { serveStatic } = require('./src/static');
+const voiceServer = require('./src/voice-server');
 
 const PORT = parseInt(process.env.PORT || '3000', 10) || 3000;
 const HOST = '0.0.0.0';
@@ -39,6 +40,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 initPresence();
+voiceServer.init(server);
 
 server.listen(PORT, HOST, () => {
   console.log('');

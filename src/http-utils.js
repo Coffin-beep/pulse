@@ -31,8 +31,10 @@ function readRawBody(req, limit = 1024 * 1024) {
       size += chunk.length;
       if (size > limit) {
         done = true;
+        // не рвём сокет: сливаем остаток, чтобы клиент получил ответ 413
+        req.removeAllListeners('data');
+        req.resume();
         reject(new ApiError(413, 'Файл слишком большой'));
-        req.destroy();
         return;
       }
       chunks.push(chunk);

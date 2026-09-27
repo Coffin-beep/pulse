@@ -12,61 +12,11 @@ const UPLOADS_DIR = storage.UPLOADS_DIR;
 //  SSE (Server-Sent Events) — живые обновления и присутствие
 // ============================================================
 
-const sseClients = new Set(); // { userId, res }
-
-function sseSend(client, event) {
-  try {
-    client.res.write(`data: ${JSON.stringify(event)}\n\n`);
-  } catch (_) { /* соединение мертво — почистим по ping/close */ }
-}
-
-function broadcast(event, exceptUserId) {
-  for (const c of sseClients) {
-    if (exceptUserId && c.userId === exceptUserId) continue;
-    sseSend(c, event);
-  }
-}
-
-// рассылка только участникам конкретного чата
-function broadcastToChat(chatId, event) {
-  const chat = storage.getChat(chatId);
-  if (!chat) return;
-  for (const c of sseClients) {
-    if (chat.members[c.userId]) sseSend(c, event);
-  }
-}
-
-function sendToCid(cid, event) {
-  for (const c of sseClients) {
-    if (c.cid === cid) {
-      sseSend(c, event);
-      return true;
-    }
-  }
-  return false;
-}
-
-function clientByCid(cid) {
-  for (const c of sseClients) {
-    if (c.cid === cid) return c;
-  }
-  return null;
-}
-
-function kickSseUser(userId) {
-  for (const c of [...sseClients]) {
-    if (c.userId === userId) {
-      sseClients.delete(c);
-      try { c.res.end(); } catch (_) { /* noop */ }
-    }
-  }
-}
-
-function onlineUserIds() {
-  const set = new Set();
-  for (const c of sseClients) set.add(c.userId);
-  return set;
-}
+// SSE-шина и голосовой сервер живут в отдельных модулях
+const {
+  sseClients, sseSend, broadcast, broadcastToChat, sendToCid, clientByCid, kickSseUser, onlineUserIds,
+} = require('./events');
+const { voiceRoomView, voiceParticipantsTotal, kickRoom } = require('./voice-server');
 
 function initPresence() {
   setInterval(() => {
@@ -78,59 +28,6 @@ function initPresence() {
       }
     }
   }, 25000).unref();
-}
-
-// ============================================================
-//  Голосовые комнаты (Discord-style, WebRTC-меш)
-//  roomId -> Map(cid -> { userId, chatId, muted })
-// ============================================================
-
-const voiceRooms = new Map();
-
-function findChatByRoomId(roomId) {
-  return storage.allChats().find((c) => (c.voiceRooms || []).some((r) => r.id === roomId)) || null;
-}
-
-function voiceRoomView(chat) {
-  return (chat.voiceRooms || []).map((r) => {
-    const participants = [];
-    const m = voiceRooms.get(r.id);
-    if (m) {
-      for (const [cid, p] of m) participants.push({ cid, userId: p.userId, muted: p.muted });
-    }
-    return { id: r.id, name: r.name, participants };
-  });
-}
-
-function voiceParticipantsTotal() {
-  let n = 0;
-  for (const m of voiceRooms.values()) n += m.size;
-  return n;
-}
-
-// отключить соединение cid от всех голосовых комнат
-function leaveVoiceCid(cid) {
-  for (const [roomId, m] of voiceRooms) {
-    const p = m.get(cid);
-    if (!p) continue;
-    m.delete(cid);
-    if (!m.size) voiceRooms.delete(roomId);
-    broadcastToChat(p.chatId, {
-      type: 'voice_state', chatId: p.chatId, roomId,
-      connId: cid, userId: p.userId, action: 'leave',
-    });
-  }
-}
-
-// выкинуть всех из комнаты (при удалении комнаты/чата)
-function kickRoom(roomId, chatId) {
-  const m = voiceRooms.get(roomId);
-  if (!m) return;
-  for (const cid of [...m.keys()]) {
-    m.delete(cid);
-    sendToCid(cid, { type: 'voice_state', chatId, roomId, connId: cid, action: 'kick' });
-  }
-  voiceRooms.delete(roomId);
 }
 
 // ============================================================
@@ -201,7 +98,7 @@ function chatView(chat, viewerId, online) {
   return {
     id: chat.id,
     type: chat.type,
-    title: chat.type === 'dialog' ? (peer ? peer.nickname : 'Чат') : chat.title,
+    title: chat.type === 'dialog' ? (peer ? peer.nickname : 'Чат') : (chat.type === 'saved' ? 'Избранное' : chat.title),
     description: chat.description,
     privacy: chat.privacy,
     ownerId: chat.ownerId,
@@ -210,7 +107,8 @@ function chatView(chat, viewerId, online) {
     memberCount: memberIds.length,
     onlineCount: memberIds.filter((id) => online.has(id)).length,
     peer,
-    voice: chat.type === 'dialog' ? [] : voiceRoomView(chat),
+    avatar: (chat.type === 'group' || chat.type === 'channel') ? (chat.avatar || '') : '',
+    voice: chat.type === 'group' ? voiceRoomView(chat) : [],
     createdAt: chat.createdAt,
   };
 }
@@ -304,6 +202,18 @@ async function route(req, res, url) {
     if (body.bio !== undefined) {
       patch.bio = String(body.bio || '').trim().slice(0, 200);
     }
+    if (body.avatar !== undefined) {
+      const avatar = String(body.avatar || '');
+      if (avatar) {
+        if (!/^data:image\/(png|jpeg|webp|gif);base64,/.test(avatar)) {
+          throw new ApiError(400, 'Неподдерживаемый формат изображения', 'avatar');
+        }
+        if (avatar.length > 320000) {
+          throw new ApiError(400, 'Картинка слишком большая — выберите поменьше', 'avatar');
+        }
+      }
+      patch.avatar = avatar;
+    }
     const updated = storage.updateUser(me.id, patch);
     broadcast({ type: 'user_updated', userId: me.id });
     return sendJSON(res, 200, storage.publicUser(updated, { online: true }));
@@ -332,12 +242,16 @@ async function route(req, res, url) {
   if (p[0] === 'chats' && p.length === 1) {
     const me = requireAuth(req, url);
     if (method === 'GET') {
+      ensureSavedChat(me.id);
       const online = onlineUserIds();
       const list = storage
         .allChats()
         .filter((c) => c.members[me.id])
         .map((c) => chatWithMeta(c, me.id, online))
         .sort((a, b) => {
+          const sa = a.type === 'saved' ? 1 : 0;
+          const sb = b.type === 'saved' ? 1 : 0;
+          if (sa !== sb) return sb - sa; // «Избранное» всегда сверху
           const ta = (a.lastMessage && a.lastMessage.createdAt) || a.createdAt;
           const tb = (b.lastMessage && b.lastMessage.createdAt) || b.createdAt;
           return tb - ta;
@@ -371,6 +285,18 @@ async function route(req, res, url) {
       }
       if (body.description !== undefined) patch.description = String(body.description || '').trim().slice(0, 300);
       if (body.privacy !== undefined) patch.privacy = body.privacy === 'public' ? 'public' : 'private';
+      if (body.avatar !== undefined) {
+        const avatar = String(body.avatar || '');
+        if (avatar) {
+          if (!/^data:image\/(png|jpeg|webp|gif);base64,/.test(avatar)) {
+            throw new ApiError(400, 'Неподдерживаемый формат изображения', 'avatar');
+          }
+          if (avatar.length > 320000) {
+            throw new ApiError(400, 'Картинка слишком большая — выберите поменьше', 'avatar');
+          }
+        }
+        patch.avatar = avatar;
+      }
       storage.updateChat(chat, patch);
       broadcast({ type: 'chat_updated', chatId: chat.id });
       return sendJSON(res, 200, { chat: chatDetail(chat, me.id, onlineUserIds()) });
@@ -420,6 +346,7 @@ async function route(req, res, url) {
     if (sub === 'leave' && method === 'POST') {
       requireMember(chat, me.id);
       if (chat.type === 'dialog') throw new ApiError(400, 'Личный чат можно только удалить');
+      if (chat.type === 'saved') throw new ApiError(400, '«Избранное» всегда с вами');
       const others = Object.keys(chat.members).filter((id) => id !== me.id);
       storage.removeMember(chat, me.id);
       if (chat.ownerId === me.id) {
@@ -451,7 +378,7 @@ async function route(req, res, url) {
     // POST /api/chats/:id/voice-rooms — создать голосовой канал
     if (sub === 'voice-rooms' && p.length === 3 && method === 'POST') {
       requireCanManage(chat, me.id);
-      if (chat.type === 'dialog') throw new ApiError(400, 'Голосовые каналы доступны в группах и каналах');
+      if (chat.type !== 'group') throw new ApiError(400, 'Голосовые каналы доступны только в группах');
       const body = await readJsonBody(req);
       const name = String(body.name || '').trim();
       if (!name || name.length > 32) throw new ApiError(400, 'Название: 1–32 символа', 'name');
@@ -599,78 +526,6 @@ async function route(req, res, url) {
         memberCount: Object.keys(c.members).length,
       }));
     return sendJSON(res, 200, { items });
-  }
-
-  // ---------- голосовые комнаты: вход / выход / состояние / сигналы ----------
-
-  if (p[0] === 'voice' && p.length === 3 && p[2] === 'join' && method === 'POST') {
-    const me = requireAuth(req, url);
-    const roomId = p[1];
-    const chat = findChatByRoomId(roomId);
-    if (!chat) throw new ApiError(404, 'Голосовой канал не найден');
-    requireMember(chat, me.id);
-    const body = await readJsonBody(req);
-    const cid = String(body.cid || '');
-    const client = clientByCid(cid);
-    if (!client || client.userId !== me.id) {
-      throw new ApiError(409, 'Нет живого соединения — обновите страницу');
-    }
-    leaveVoiceCid(cid); // если уже был в другой комнате — выходим
-    let m = voiceRooms.get(roomId);
-    if (!m) {
-      m = new Map();
-      voiceRooms.set(roomId, m);
-    }
-    m.set(cid, { userId: me.id, chatId: chat.id, muted: false });
-    const peers = [];
-    for (const [c, pp] of m) {
-      if (c !== cid) peers.push({ cid: c, userId: pp.userId, muted: pp.muted });
-    }
-    broadcastToChat(chat.id, {
-      type: 'voice_state', chatId: chat.id, roomId,
-      connId: cid, userId: me.id, muted: false, action: 'join',
-    });
-    return sendJSON(res, 200, { roomId, chatId: chat.id, me: cid, peers });
-  }
-
-  if (p[0] === 'voice' && p.length === 3 && p[2] === 'leave' && method === 'POST') {
-    const me = requireAuth(req, url);
-    const body = await readJsonBody(req);
-    const cid = String(body.cid || '');
-    const client = clientByCid(cid);
-    if (!client || client.userId !== me.id) throw new ApiError(409, 'Нет живого соединения');
-    leaveVoiceCid(cid);
-    return sendJSON(res, 200, { ok: true });
-  }
-
-  if (p[0] === 'voice' && p.length === 3 && p[2] === 'state' && method === 'POST') {
-    const me = requireAuth(req, url);
-    const roomId = p[1];
-    const body = await readJsonBody(req);
-    const cid = String(body.cid || '');
-    const m = voiceRooms.get(roomId);
-    const ent = m && m.get(cid);
-    if (!ent || ent.userId !== me.id) throw new ApiError(404, 'Вы не в этой комнате');
-    ent.muted = !!body.muted;
-    broadcastToChat(ent.chatId, {
-      type: 'voice_state', chatId: ent.chatId, roomId,
-      connId: cid, userId: me.id, muted: ent.muted, action: 'state',
-    });
-    return sendJSON(res, 200, { ok: true });
-  }
-
-  if (p[0] === 'voice' && p.length === 3 && p[2] === 'signal' && method === 'POST') {
-    const me = requireAuth(req, url);
-    const roomId = p[1];
-    const body = await readJsonBody(req);
-    const cid = String(body.cid || '');
-    const m = voiceRooms.get(roomId);
-    const ent = m && m.get(cid);
-    if (!ent || ent.userId !== me.id) throw new ApiError(404, 'Вы не в этой комнате');
-    const to = String(body.to || '');
-    if (!m.has(to)) throw new ApiError(404, 'Адресат не в комнате');
-    sendToCid(to, { type: 'voice_signal', roomId, from: cid, userId: me.id, data: body.data });
-    return sendJSON(res, 200, { ok: true });
   }
 
   // ---------- админ-панель ----------
@@ -824,6 +679,9 @@ async function handleRegister(req, res) {
   const news = getNewsChannel();
   if (news) storage.addMember(news, user.id, 'member');
 
+  // личный чат «Избранное»
+  ensureSavedChat(user.id);
+
   const token = storage.createSession(user.id);
   broadcast({ type: 'user_updated', userId: user.id });
   return sendJSON(res, 200, { token, user: storage.publicUser(user, { online: true }) });
@@ -852,6 +710,11 @@ async function handleLogin(req, res) {
 async function handleCreateChat(req, res, me) {
   const body = await readJsonBody(req);
   const type = body.type;
+
+  if (type === 'saved') {
+    const chat = ensureSavedChat(me.id);
+    return sendJSON(res, 200, { chat: chatWithMeta(chat, me.id, onlineUserIds()), created: false });
+  }
 
   if (type === 'dialog') {
     const peer = storage.getUser(String(body.userId || ''));
@@ -907,7 +770,6 @@ function handleEvents(req, res, url) {
 
   req.on('close', () => {
     sseClients.delete(client);
-    leaveVoiceCid(cid);
     if (!onlineUserIds().has(user.id)) {
       broadcast({ type: 'presence', userId: user.id, online: false });
     }
@@ -947,6 +809,18 @@ function handleUpload(req, res, url, parts) {
     'Accept-Ranges': 'none',
   });
   fs.createReadStream(filePath).pipe(res);
+}
+
+// ============================================================
+//  «Избранное» — личный чат-хранилище каждого пользователя
+// ============================================================
+
+function ensureSavedChat(userId) {
+  let chat = storage.allChats().find((c) => c.type === 'saved' && c.members[userId]);
+  if (!chat) {
+    chat = storage.createChat({ type: 'saved', title: 'Избранное', ownerId: userId, memberIds: [] });
+  }
+  return chat;
 }
 
 // ============================================================

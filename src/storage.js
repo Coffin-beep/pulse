@@ -130,6 +130,7 @@ function publicUser(user, extra) {
     username: user.username,
     nickname: user.nickname,
     bio: user.bio || '',
+    avatar: user.avatar || '',
     isAdmin: !!user.isAdmin,
     banned: !!user.banned,
     createdAt: user.createdAt,
@@ -196,7 +197,8 @@ function createChat({ type, title = '', description = '', privacy = 'private', o
     type, // 'dialog' | 'group' | 'channel'
     title: String(title || '').trim(),
     description: String(description || '').trim(),
-    privacy: type === 'dialog' ? 'private' : (privacy === 'public' ? 'public' : 'private'),
+    privacy: type === 'dialog' || type === 'saved' ? 'private' : (privacy === 'public' ? 'public' : 'private'),
+    avatar: '',
     ownerId,
     members: {},
     voiceRooms: [],

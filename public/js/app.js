@@ -42,6 +42,9 @@ let emojiPop = null;
 
 window.addEventListener('pulse:logout', () => showAuth(true));
 
+loadSettings();
+applySettings();
+
 (async function boot() {
   if (getToken()) {
     try {
@@ -247,6 +250,7 @@ function buildLayout() {
         state.user.isAdmin
           ? el('button', { class: 'icon-btn icon-btn--admin', title: 'Админ-панель', onclick: openAdminPanel }, icon('shield', 19))
           : null,
+        el('button', { class: 'icon-btn', title: 'Настройки', onclick: openSettingsModal }, icon('settings', 19)),
         el('button', { class: 'icon-btn', title: 'Обзор сообществ', onclick: openDiscover }, icon('compass', 19)),
         el('button', { class: 'icon-btn', title: 'Создать чат, группу или канал', onclick: (e) => openNewChatMenu(e.currentTarget) }, icon('edit', 19)),
         refs.avatarBtn,
@@ -396,17 +400,21 @@ function chatListItem(chat) {
     previewParts = 'Нет сообщений';
   }
 
-  const avEntity = chat.type === 'dialog'
-    ? { id: chat.peer ? chat.peer.id : chat.id, name: chat.peer ? chat.peer.nickname : chat.title, online: chat.peer && chat.peer.online }
-    : { id: chat.id, name: chat.title, type: chat.type };
+  const isSaved = chat.type === 'saved';
+  const avEntity = isSaved
+    ? { id: 'saved' + state.user.id, name: 'Избранное' }
+    : chat.type === 'dialog'
+      ? { id: chat.peer ? chat.peer.id : chat.id, name: chat.peer ? chat.peer.nickname : chat.title, online: chat.peer && chat.peer.online, avatar: chat.peer && chat.peer.avatar }
+      : { id: chat.id, name: chat.title, type: chat.type, avatar: chat.avatar };
+  const avOpts = isSaved ? { size: 48, icon: 'bookmark' } : { size: 48, typeIcon: true };
 
   return el('div', {
-    class: 'chat-item' +
+    class: 'chat-item' + (isSaved ? ' chat-item--saved' : '') +
       (chat.id === state.currentChatId ? ' chat-item--active' : '') +
       (chat.unread > 0 ? ' chat-item--unread' : ''),
     onclick: () => openChat(chat.id),
   },
-    avatar(avEntity, { size: 48, typeIcon: true }),
+    avatar(avEntity, avOpts),
     el('div', { class: 'chat-item__body' },
       el('div', { class: 'chat-item__top' },
         el('span', { class: 'chat-item__name' }, chat.title),
@@ -511,6 +519,7 @@ function renderEmptyMain() {
     el('p', { class: 'empty__sub' }, 'Выберите чат слева или начните что-то новое'),
     el('div', { class: 'empty__actions' },
       el('button', { class: 'btn btn--primary', onclick: () => openUserPickerDialog() }, icon('user', 16), ' Личный чат'),
+      el('button', { class: 'btn btn--ghost', onclick: openSavedChat }, icon('bookmark', 16), ' Избранное'),
       el('button', { class: 'btn btn--ghost', onclick: () => openCreateChatModal('group') }, icon('users', 16), ' Группа'),
       el('button', { class: 'btn btn--ghost', onclick: () => openCreateChatModal('channel') }, icon('megaphone', 16), ' Канал'),
     ),
@@ -524,6 +533,7 @@ function canPost(chat) {
 }
 
 function chatSubtitle(chat) {
+  if (chat.type === 'saved') return 'личные заметки · видны только вам';
   if (chat.type === 'dialog') {
     return chat.peer ? (chat.peer.online ? 'в сети' : 'был(а) недавно') : '';
   }
@@ -540,13 +550,16 @@ function renderChatArea() {
   refs.main.classList.add('chat-area--open');
 
   const entity = chat.type === 'dialog' && chat.peer
-    ? { id: chat.peer.id, name: chat.peer.nickname, online: chat.peer.online }
-    : { id: chat.id, name: chat.title, type: chat.type };
+    ? { id: chat.peer.id, name: chat.peer.nickname, online: chat.peer.online, avatar: chat.peer.avatar }
+    : chat.type === 'saved'
+      ? { id: 'saved' + state.user.id, name: 'Избранное' }
+      : { id: chat.id, name: chat.title, type: chat.type, avatar: chat.avatar };
+  const headAvOpts = chat.type === 'saved' ? { size: 42, icon: 'bookmark' } : { size: 42, typeIcon: true };
 
   refs.chatHeadSub = el('div', { class: 'chat-head__sub' }, chatSubtitle(chat));
   refs.main.append(el('header', { class: 'chat-head' },
     el('button', { class: 'icon-btn chat-head__back', title: 'Назад', onclick: closeChat }, icon('back', 20)),
-    avatar(entity, { size: 42, typeIcon: true }),
+    avatar(entity, headAvOpts),
     el('div', { class: 'chat-head__info' },
       el('div', { class: 'chat-head__title' }, chat.title),
       refs.chatHeadSub,
@@ -557,7 +570,7 @@ function renderChatArea() {
   ));
 
   refs.messagesEl = el('div', { class: 'messages' });
-  if (chat.type !== 'dialog') {
+  if (chat.type === 'group') {
     refs.voiceSection = el('div', { class: 'voice-section' });
     refs.main.append(refs.voiceSection);
     renderVoiceSection();
@@ -616,6 +629,9 @@ function appendMessages(newMsgs) {
   if (nearBottom || fresh.some((m) => m.senderId === state.user.id)) {
     scrollBottom();
   }
+  if (state.settings && state.settings.sound && fresh.some((m) => m.senderId !== state.user.id)) {
+    playBlip();
+  }
 }
 
 function daySeparator(ts) {
@@ -636,7 +652,7 @@ function appendMessageNode(m, prev, chat) {
     dataset: { id: String(m.id) },
   },
     !mine && chat.type !== 'dialog'
-      ? avatar({ id: m.senderId, name: sender.nickname }, { size: 30, cls: 'msg__avatar', dot: false })
+      ? avatar({ id: m.senderId, name: sender.nickname, avatar: sender.avatar }, { size: 30, cls: 'msg__avatar', dot: false })
       : null,
     el('div', { class: 'msg__main' },
       showSenderInfo ? el('div', { class: 'msg__sender' }, sender.nickname) : null,
@@ -772,9 +788,15 @@ function renderComposer(chat) {
   refs.textarea = el('textarea', { class: 'composer__input', rows: '1', placeholder: 'Написать сообщение…' });
   refs.textarea.addEventListener('input', () => { autoGrow(refs.textarea); updateSendButtons(); });
   refs.textarea.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendText();
+    const enterSends = !state.settings || state.settings.enterToSend !== false;
+    if (e.key === 'Enter') {
+      if (enterSends && !e.shiftKey) {
+        e.preventDefault();
+        sendText();
+      } else if (!enterSends && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendText();
+      }
     }
   });
 
@@ -964,6 +986,7 @@ function onServerEvent(e) {
   switch (e.type) {
     case 'new_message':
       if (e.chatId === state.currentChatId) fetchNewMessages();
+      else notifyAboutChat(e.chatId);
       scheduleChatsRefresh();
       break;
     case 'chat_created':
@@ -986,10 +1009,6 @@ function onServerEvent(e) {
       break;
     case 'voice_state':
       applyVoiceState(e);
-      if (state.voice) state.voice.handleVoiceState(e);
-      break;
-    case 'voice_signal':
-      if (state.voice) state.voice.handleSignal(e);
       break;
     default:
       break;
@@ -1316,6 +1335,7 @@ function openDiscover() {
 // --- информация о чате ---
 
 function chatTypeLabel(chat) {
+  if (chat.type === 'saved') return 'Избранное · ваше личное хранилище';
   if (chat.type === 'dialog') return chat.peer ? '@' + chat.peer.username : 'Личный чат';
   const kind = chat.type === 'channel' ? 'Канал' : 'Группа';
   const priv = chat.privacy === 'public' ? 'публичное' : 'приватное';
@@ -1328,15 +1348,25 @@ function openChatInfo() {
   const m = modal({ title: 'Информация' });
   const body = m.body;
   const isDialog = chat.type === 'dialog';
-  const canManage = !isDialog && (chat.role === 'owner' || chat.role === 'admin');
+  const isSaved = chat.type === 'saved';
+  const canManage = !isDialog && !isSaved && (chat.role === 'owner' || chat.role === 'admin');
+
+  const avEntity = isDialog && chat.peer
+    ? { id: chat.peer.id, name: chat.peer.nickname, online: chat.peer.online, avatar: chat.peer.avatar }
+    : isSaved
+      ? { id: 'saved' + state.user.id, name: 'Избранное' }
+      : { id: chat.id, name: chat.title, type: chat.type, avatar: chat.avatar };
+  const bigAv = avatar(avEntity, isSaved ? { size: 72, icon: 'bookmark' } : { size: 72, typeIcon: true });
+  const avWrap = el('div', { class: 'chatinfo__avatar-wrap' }, bigAv);
+  if (canManage) {
+    avWrap.append(el('button', {
+      class: 'avatar-cam', title: 'Загрузить аватар сообщества',
+      onclick: () => uploadChatAvatarFlow(chat, m),
+    }, icon('camera', 14)));
+  }
 
   body.append(el('div', { class: 'chatinfo__head' },
-    avatar(
-      isDialog && chat.peer
-        ? { id: chat.peer.id, name: chat.peer.nickname, online: chat.peer.online }
-        : { id: chat.id, name: chat.title, type: chat.type },
-      { size: 72, typeIcon: true }
-    ),
+    avWrap,
     el('div', {},
       el('div', { class: 'chatinfo__title' }, chat.title),
       el('div', { class: 'chatinfo__sub' }, chatTypeLabel(chat)),
@@ -1347,7 +1377,7 @@ function openChatInfo() {
     body.append(el('p', { class: 'chatinfo__desc' }, chat.description));
   }
 
-  if (!isDialog) {
+  if (!isDialog && !isSaved) {
     const membersBlock = el('div', { class: 'chatinfo__members' });
     body.append(membersBlock);
     renderMembers();
@@ -1422,10 +1452,10 @@ function openChatInfo() {
   }
 
   const actions = el('div', { class: 'modal__actions' });
-  if (!isDialog) {
+  if (!isDialog && !isSaved) {
     actions.append(el('button', { class: 'btn btn--ghost', onclick: leaveChatFlow }, icon('logout', 15), ' Покинуть'));
   }
-  if (isDialog || chat.role === 'owner') {
+  if (!isSaved && (isDialog || chat.role === 'owner')) {
     actions.append(el('button', { class: 'btn btn--danger', onclick: deleteChatFlow }, icon('trash', 15), ' Удалить чат'));
   }
   if (actions.children.length) body.append(actions);
@@ -1476,9 +1506,45 @@ function openProfileModal() {
   const errEl = el('div', { class: 'field-error' });
   const saveBtn = el('button', { class: 'btn btn--primary' }, 'Сохранить');
 
+  const avWrap = el('div', { class: 'chatinfo__avatar-wrap' },
+    avatar({ id: u.id, name: u.nickname, avatar: u.avatar }, { size: 72, dot: false }),
+    el('button', {
+      class: 'avatar-cam', title: 'Загрузить фото профиля',
+      onclick: async () => {
+        try {
+          const dataUrl = await pickAvatarImage();
+          if (!dataUrl) return;
+          const res = await api.patch('/api/me', { avatar: dataUrl });
+          state.user = res;
+          updateUserHead();
+          loadChats();
+          toast('Аватар обновлён 💜', 'success');
+          m.close();
+          openProfileModal();
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+      },
+    }, icon('camera', 14)),
+    u.avatar ? el('button', {
+      class: 'avatar-cam avatar-cam--del', title: 'Убрать фото',
+      onclick: async () => {
+        try {
+          const res = await api.patch('/api/me', { avatar: '' });
+          state.user = res;
+          updateUserHead();
+          loadChats();
+          toast('Фото удалено');
+          m.close();
+          openProfileModal();
+        } catch (err) { toast(err.message, 'error'); }
+      },
+    }, icon('x', 12)) : null,
+  );
+
   m.body.append(
     el('div', { class: 'chatinfo__head' },
-      avatar({ id: u.id, name: u.nickname }, { size: 72, dot: false }),
+      avWrap,
       el('div', {},
         el('div', { class: 'chatinfo__title' }, u.nickname),
         el('div', { class: 'chatinfo__sub' }, '@' + u.username),
@@ -1514,7 +1580,7 @@ function openProfileModal() {
 // ============================================================
 
 function canManageVoice(chat) {
-  return !!chat && chat.type !== 'dialog' && (chat.role === 'owner' || chat.role === 'admin');
+  return !!chat && chat.type === 'group' && (chat.role === 'owner' || chat.role === 'admin');
 }
 
 function voiceUserName(userId) {
@@ -1554,7 +1620,7 @@ function renderVoiceSection() {
   if (!refs.voiceSection) return;
   const chat = state.chatDetail;
   clear(refs.voiceSection);
-  if (!chat || chat.type === 'dialog') return;
+  if (!chat || chat.type !== 'group') return;
 
   const rooms = (chat.voice || []).map((r) => ({
     ...r,
@@ -1582,19 +1648,30 @@ function renderVoiceSection() {
     },
       el('span', { class: 'voice-room__icon' }, icon('volume', 15)),
       el('span', { class: 'voice-room__name' }, room.name),
-      el('span', { class: 'voice-room__parts' },
-        room.participants.map((p) => el('span', {
-          class: 'voice-part' + (p.muted ? ' voice-part--muted' : ''),
-          title: voiceUserName(p.userId) + (p.muted ? ' · микрофон выключен' : ' · говорит'),
-        }, avatar({ id: p.userId, name: voiceUserName(p.userId) }, { size: 22, dot: false }),
-          p.muted ? el('span', { class: 'voice-part__mute' }, icon('micOff', 9)) : null)),
-        room.participants.length === 0 && active ? el('span', { class: 'voice-part__solo' }, 'вы') : null,
-      ),
+      el('span', { class: 'voice-room__users' },
+        room.participants.length > 0
+          ? room.participants.length + ' ' + plural(room.participants.length, ['на связи', 'на связи', 'на связи'])
+          : (active ? 'вы в канале' : '')),
       manage ? el('button', {
         class: 'voice-room__del', title: 'Удалить канал',
         onclick: (e) => { e.stopPropagation(); deleteVoiceRoomFlow(room); },
       }, icon('x', 12)) : null,
     ));
+
+    // участники — вертикально под каналом, как в Discord
+    if (room.participants.length) {
+      const parts = el('div', { class: 'voice-parts' });
+      for (const p of room.participants) {
+        const itsMe = state.voice && state.voice.roomId === room.id && p.cid === state.voice.cid;
+        const u = state.users[p.userId] || {};
+        parts.append(el('div', { class: 'voice-part-row' + (itsMe ? ' voice-part-row--me' : '') },
+          avatar({ id: p.userId, name: voiceUserName(p.userId), avatar: u.avatar }, { size: 26, dot: false }),
+          el('span', { class: 'voice-part-row__name' }, voiceUserName(p.userId) + (itsMe ? ' (вы)' : '')),
+          p.muted ? el('span', { class: 'voice-part-row__mute', title: 'Микрофон выключен' }, icon('micOff', 12)) : null,
+        ));
+      }
+      list.append(parts);
+    }
   }
   refs.voiceSection.append(list);
 }
@@ -1689,7 +1766,7 @@ function renderCallPanel() {
       class: 'call-avatar' + (p.muted ? ' call-avatar--muted' : ''),
       title: voiceUserName(p.userId),
     },
-      avatar({ id: p.userId, name: voiceUserName(p.userId) }, { size: 38, dot: false }),
+      avatar({ id: p.userId, name: voiceUserName(p.userId), avatar: (state.users[p.userId] || {}).avatar }, { size: 38, dot: false }),
       p.muted ? el('span', { class: 'call-avatar__mute' }, icon('micOff', 11)) : null,
     );
     state.callAvatars[p.cid] = wrap;
@@ -1941,6 +2018,236 @@ function adminUserRow(u, refresh) {
       el('span', { class: 'admin-row__sub' }, '@' + u.username + ' · ' + u.email),
     ),
     actions,
+  );
+}
+
+// ============================================================
+//  «Избранное» — личный чат пользователя
+// ============================================================
+
+async function openSavedChat() {
+  try {
+    const r = await api.post('/api/chats', { type: 'saved' });
+    await loadChats();
+    openChat(r.chat.id);
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+// ============================================================
+//  Аватарки: выбор и обрезка картинки на клиенте
+// ============================================================
+
+function pickAvatarImage() {
+  return new Promise((resolve) => {
+    const input = el('input', { type: 'file', accept: 'image/*' });
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      input.remove();
+      if (!file) { resolve(null); return; }
+      try {
+        resolve(await resizeToAvatar(file));
+      } catch (_) {
+        toast('Не удалось обработать изображение', 'error');
+        resolve(null);
+      }
+    });
+    input.click();
+  });
+}
+
+function resizeToAvatar(file, size = 256) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('read error'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('bad image'));
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = size;
+          canvas.height = size;
+          const ctx = canvas.getContext('2d');
+          const min = Math.min(img.width, img.height);
+          ctx.drawImage(img, (img.width - min) / 2, (img.height - min) / 2, min, min, 0, 0, size, size);
+          let out = '';
+          try { out = canvas.toDataURL('image/webp', 0.85); } catch (_) { /* noop */ }
+          if (!out || !out.startsWith('data:image/webp')) out = canvas.toDataURL('image/jpeg', 0.85);
+          resolve(out);
+        } catch (e) {
+          reject(e);
+        }
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadChatAvatarFlow(chat, m) {
+  try {
+    const dataUrl = await pickAvatarImage();
+    if (!dataUrl) return;
+    await api.patch('/api/chats/' + chat.id, { avatar: dataUrl });
+    const res = await api.get('/api/chats/' + chat.id);
+    state.chatDetail = res.chat;
+    m.close();
+    renderChatArea();
+    loadChats();
+    toast('Аватар сообщества обновлён 💜', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+// ============================================================
+//  Настройки мессенджера
+// ============================================================
+
+const DEFAULT_SETTINGS = {
+  notifications: false,
+  sound: true,
+  enterToSend: true,
+  compact: false,
+  wallpaper: 'aura',
+};
+
+function loadSettings() {
+  let s = {};
+  try { s = JSON.parse(localStorage.getItem('pulse_settings') || '{}'); } catch (_) { s = {}; }
+  state.settings = { ...DEFAULT_SETTINGS, ...s };
+}
+
+function saveSettings() {
+  try { localStorage.setItem('pulse_settings', JSON.stringify(state.settings)); } catch (_) { /* noop */ }
+}
+
+function applySettings() {
+  const s = state.settings || DEFAULT_SETTINGS;
+  document.body.classList.toggle('compact', !!s.compact);
+  document.body.dataset.wallpaper = s.wallpaper || 'aura';
+}
+
+let blipCtx = null;
+function playBlip() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    blipCtx = blipCtx || new Ctx();
+    if (blipCtx.state === 'suspended') blipCtx.resume().catch(() => { /* noop */ });
+    const o = blipCtx.createOscillator();
+    const g = blipCtx.createGain();
+    o.connect(g);
+    g.connect(blipCtx.destination);
+    o.frequency.value = 620;
+    g.gain.value = 0.05;
+    o.start();
+    o.frequency.exponentialRampToValueAtTime(840, blipCtx.currentTime + 0.09);
+    g.gain.exponentialRampToValueAtTime(0.0001, blipCtx.currentTime + 0.22);
+    o.stop(blipCtx.currentTime + 0.24);
+  } catch (_) { /* noop */ }
+}
+
+function canNotify() {
+  return state.settings && state.settings.notifications &&
+    typeof Notification !== 'undefined' && Notification.permission === 'granted';
+}
+
+function notifyAboutChat(chatId) {
+  const chat = state.chats.find((c) => c.id === chatId);
+  if (!chat || chat.type === 'saved') return;
+  if (chat.type === 'channel' && chat.role !== 'owner' && chat.role !== 'admin') return; // каналы не спамят
+  if (state.settings && state.settings.sound) playBlip();
+  if (!canNotify() || !document.hidden) return;
+  try {
+    const n = new Notification(chat.title, { body: 'Новое сообщение 💜', tag: 'pulse-' + chatId });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch (_) { /* noop */ }
+}
+
+function switchRow(label, desc, value, onChange) {
+  const knob = el('span', { class: 'switch__knob' });
+  const sw = el('button', {
+    class: 'switch' + (value ? ' switch--on' : ''),
+    type: 'button',
+    role: 'switch',
+    'aria-checked': String(!!value),
+    onclick: () => {
+      const on = !sw.classList.contains('switch--on');
+      sw.classList.toggle('switch--on', on);
+      sw.setAttribute('aria-checked', String(on));
+      onChange(on);
+    },
+  }, knob);
+  return el('div', { class: 'settings-row' },
+    el('div', { class: 'settings-row__info' },
+      el('span', { class: 'settings-row__label' }, label),
+      desc ? el('span', { class: 'settings-row__desc' }, desc) : null),
+    sw,
+  );
+}
+
+function openSettingsModal() {
+  const s = { ...(state.settings || DEFAULT_SETTINGS) };
+  const m = modal({ title: 'Настройки' });
+
+  function persist() {
+    state.settings = { ...s };
+    saveSettings();
+    applySettings();
+  }
+
+  const wpSeg = el('div', { class: 'segmented' });
+  const wpBtns = new Map();
+  for (const [id, label] of [['aura', 'Аура'], ['dots', 'Точки'], ['none', 'Без фона']]) {
+    const b = el('button', {
+      class: 'segmented__btn' + (s.wallpaper === id ? ' segmented__btn--active' : ''),
+      type: 'button',
+    }, label);
+    b.addEventListener('click', () => {
+      s.wallpaper = id;
+      for (const [wid, btn] of wpBtns) btn.classList.toggle('segmented__btn--active', wid === id);
+      persist();
+    });
+    wpBtns.set(id, b);
+    wpSeg.append(b);
+  }
+
+  m.body.append(
+    el('div', { class: 'settings-group' },
+      el('div', { class: 'chatinfo__section-title', style: 'padding: 0 0 4px' }, 'Уведомления'),
+      switchRow('Звук новых сообщений', 'Короткий сигнал при входящем', s.sound, (on) => { s.sound = on; persist(); }),
+      switchRow('Системные уведомления', 'Push-уведомления браузера в фоне', s.notifications, async (on) => {
+        if (on && typeof Notification !== 'undefined' && Notification.permission !== 'granted') {
+          try {
+            const p = await Notification.requestPermission();
+            if (p !== 'granted') {
+              toast('Браузер не дал разрешение на уведомления', 'error');
+              m.close();
+              return;
+            }
+          } catch (_) { /* noop */ }
+        }
+        s.notifications = on;
+        persist();
+      }),
+    ),
+    el('div', { class: 'settings-group' },
+      el('div', { class: 'chatinfo__section-title', style: 'padding: 0 0 4px' }, 'Чаты'),
+      switchRow('Отправка по Enter', 'Иначе — Ctrl+Enter', s.enterToSend, (on) => { s.enterToSend = on; persist(); }),
+      switchRow('Компактные сообщения', 'Меньше отступов между пузырями', s.compact, (on) => { s.compact = on; persist(); }),
+      el('div', { class: 'settings-row settings-row--col' },
+        el('div', { class: 'settings-row__info' },
+          el('span', { class: 'settings-row__label' }, 'Фон области чата'),
+          el('span', { class: 'settings-row__desc' }, 'Тонкая текстура за сообщениями')),
+        wpSeg),
+    ),
+    el('p', { class: 'form__hint', style: 'text-align:center' },
+      'Pulse 💜 · данные хранятся локально на этом сервере'),
   );
 }
 

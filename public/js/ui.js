@@ -72,6 +72,11 @@ const ICONS = {
   headphones: '<path d="M3 14v-3a9 9 0 0 1 18 0v3"/><path d="M3 14h4v7H5a2 2 0 0 1-2-2v-5Z"/><path d="M21 14h-4v7h2a2 2 0 0 0 2-2v-5Z"/>',
   micOff: '<path d="m2 2 20 20"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><path d="M15 9.34V5a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2"/><path d="M12 19v3"/>',
   speaker: '<path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/>',
+  bookmark: '<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2Z"/>',
+  camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2Z"/><circle cx="12" cy="13" r="4"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>',
+  bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+  moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/>',
 };
 
 export function icon(name, size = 20, cls = '') {
@@ -121,7 +126,8 @@ export function initialsOf(name) {
 }
 
 /**
- * Аватар. entity: {id, name, online, type?}
+ * Аватар. entity: {id, name, online, type?, avatar?}
+ * opts: { size, dot, typeIcon, icon — фиксированная иконка вместо инициалов }
  */
 export function avatar(entity, opts = {}) {
   const size = opts.size || 48;
@@ -129,13 +135,30 @@ export function avatar(entity, opts = {}) {
   const node = el('div', {
     class: 'avatar' + (opts.cls ? ' ' + opts.cls : ''),
     style: `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.38)}px;background:linear-gradient(135deg,${c1},${c2})`,
-  }, initialsOf(entity && (entity.name || entity.nickname || entity.title)));
+  });
+
+  if (opts.icon) {
+    node.appendChild(el('span', { class: 'avatar__glyph' }, icon(opts.icon, Math.round(size * 0.46))));
+  } else {
+    node.appendChild(el('span', { class: 'avatar__initials' }, initialsOf(entity && (entity.name || entity.nickname || entity.title))));
+  }
+
+  // загруженная картинка закрывает инициалы (они остаются фолбэком)
+  if (entity && entity.avatar) {
+    node.appendChild(el('img', {
+      class: 'avatar__img',
+      src: entity.avatar,
+      alt: '',
+      loading: 'lazy',
+      onerror: (e) => { e.target.remove(); },
+    }));
+  }
 
   if (entity && entity.online && opts.dot !== false) {
     node.appendChild(el('span', { class: 'avatar__dot' }));
   }
 
-  if (opts.typeIcon && (entity.type === 'group' || entity.type === 'channel')) {
+  if (opts.typeIcon && !entity.avatar && (entity.type === 'group' || entity.type === 'channel')) {
     node.appendChild(el('span', { class: 'avatar__type' }, icon(entity.type === 'channel' ? 'megaphone' : 'users', 10)));
   }
   return node;
