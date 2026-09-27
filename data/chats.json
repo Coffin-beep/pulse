@@ -1,0 +1,76 @@
+{
+  "items": {
+    "c_f9b1575120f23cbe7d": {
+      "id": "c_f9b1575120f23cbe7d",
+      "type": "channel",
+      "title": "Pulse · Новости",
+      "description": "Официальный канал мессенджера Pulse: новости и подсказки 💜",
+      "privacy": "public",
+      "ownerId": "u_577ce2d074d00e1324",
+      "members": {
+        "u_577ce2d074d00e1324": {
+          "role": "owner",
+          "joinedAt": 1790443004334,
+          "lastRead": 0
+        },
+        "u_926f84106d3278b278": {
+          "role": "member",
+          "joinedAt": 1790443004339,
+          "lastRead": 4
+        },
+        "u_b94df181ba7f742efa": {
+          "role": "member",
+          "joinedAt": 1790446121359,
+          "lastRead": 0
+        }
+      },
+      "createdAt": 1790443004334
+    },
+    "c_ecb30738bd3f228b71": {
+      "id": "c_ecb30738bd3f228b71",
+      "type": "dialog",
+      "title": "",
+      "description": "",
+      "privacy": "private",
+      "ownerId": "u_926f84106d3278b278",
+      "members": {
+        "u_926f84106d3278b278": {
+          "role": "owner",
+          "joinedAt": 1790446031350,
+          "lastRead": 1
+        },
+        "u_577ce2d074d00e1324": {
+          "role": "member",
+          "joinedAt": 1790446031350,
+          "lastRead": 0
+        }
+      },
+      "voiceRooms": [],
+      "createdAt": 1790446031350,
+      "dialogKey": "u_577ce2d074d00e1324~u_926f84106d3278b278"
+    },
+    "c_f1d4258a52aedc02e9": {
+      "id": "c_f1d4258a52aedc02e9",
+      "type": "dialog",
+      "title": "",
+      "description": "",
+      "privacy": "private",
+      "ownerId": "u_b94df181ba7f742efa",
+      "members": {
+        "u_b94df181ba7f742efa": {
+          "role": "owner",
+          "joinedAt": 1790446125047,
+          "lastRead": 1
+        },
+        "u_926f84106d3278b278": {
+          "role": "member",
+          "joinedAt": 1790446125047,
+          "lastRead": 2
+        }
+      },
+      "voiceRooms": [],
+      "createdAt": 1790446125047,
+      "dialogKey": "u_926f84106d3278b278~u_b94df181ba7f742efa"
+    }
+  }
+}

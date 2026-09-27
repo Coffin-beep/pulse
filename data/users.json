@@ -1,0 +1,40 @@
+{
+  "items": {
+    "u_926f84106d3278b278": {
+      "id": "u_926f84106d3278b278",
+      "username": "coffin",
+      "nickname": "COFFIN",
+      "email": "ilya1607009@mail.ru",
+      "salt": "629a52bcc8779736fa8f8a50740d239a",
+      "passwordHash": "61cfc392e660d91c712f6402a4220e509f950af85482377c318926341b91651daaec2c188128d385c0b13ecba4ffb6a8b25fc9d51d98bbc6900cdba679b4b968",
+      "bio": "",
+      "createdAt": 1790443004295,
+      "isAdmin": true,
+      "banned": false
+    },
+    "u_577ce2d074d00e1324": {
+      "id": "u_577ce2d074d00e1324",
+      "username": "pulse",
+      "nickname": "Pulse",
+      "email": "pulse@system.local",
+      "salt": "bc1a97d59331157fe25e3d8256d73527",
+      "passwordHash": "fb1e5ae29abefd8f53429096bba234705c898ae11a7690fea557dbca0f566c0289f4cb0581d894b318d6e19bcdb9cd110e3ca39d89b22766f2643ac8d7426b0c",
+      "bio": "",
+      "createdAt": 1790443004332,
+      "isAdmin": false,
+      "banned": false
+    },
+    "u_b94df181ba7f742efa": {
+      "id": "u_b94df181ba7f742efa",
+      "username": "zaver",
+      "nickname": "НЕТ",
+      "email": "1@ii.ru",
+      "salt": "01d1a7f06b75f26de82bf43a5ffa471b",
+      "passwordHash": "ba296f1de3b11192e4409ac342ca1fec1ece6a2bf38a77f0ee9c18d2062f8d3268b2a53ccb0bd552d311b05384d61e907f61cad15e6ee167c65333fd382cb5e8",
+      "isAdmin": false,
+      "banned": true,
+      "bio": "",
+      "createdAt": 1790446121357
+    }
+  }
+}
