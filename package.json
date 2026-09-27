@@ -1,0 +1,14 @@
+{
+  "name": "pulse-messenger",
+  "version": "0.1.0",
+  "description": "Pulse — мессенджер с тёмно-фиолетовым дизайном: регистрация с @username, чаты, голосовые сообщения, группы и каналы",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT"
+}
